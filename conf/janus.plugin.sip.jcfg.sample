@@ -41,7 +41,7 @@ general: {
 	#dscp_video_rtp = 26
 	
 	# Whether notify events should be handled by the application (default=false)
-	handle_notify_message = true
+	handle_notify_message = false
 
 
 }
