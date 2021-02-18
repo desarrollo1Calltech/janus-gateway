@@ -39,5 +39,9 @@ general: {
 	# No packet marking is done if this parameter is undefined or equal to 0
 	#dscp_audio_rtp = 46
 	#dscp_video_rtp = 26
+	
+	# Whether notify events should be handled by the application (default=false)
+	handle_notify_message = true
+
 
 }
