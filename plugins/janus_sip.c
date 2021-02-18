@@ -6819,7 +6819,7 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 
 
 
-/* Thread to handle notify incoming messages - RHEP */
+/* Thread to handle notify incoming messages --  RHEP */
 static void *janus_sip_notify_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining SIP Notify handler thread\n");
 	sofia_dispatch_event_t *de = NULL;
