@@ -647,6 +647,8 @@
 #include <sofia-sip/url.h>
 #include <sofia-sip/tport_tag.h>
 #include <sofia-sip/su_log.h>
+#include <sofia-sip/nua_stack.h> // RHEP
+#define NUTAG_WITH_THIS_MSG(msg) nutag_with, tag_ptr_v(msg) // RHEP
 
 #include "../debug.h"
 #include "../apierror.h"
@@ -820,6 +822,26 @@ static int dscp_video_rtp = 0;
 static GThread *handler_thread;
 static void *janus_sip_handler(void *data);
 static void janus_sip_hangup_media_internal(janus_plugin_session *handle);
+
+
+/* RHEP start */
+static gboolean handle_notify_message = FALSE;
+static GThread *notify_handler_thread;				
+static void *janus_sip_notify_handler(void *data);
+
+typedef struct sofia_dispatch_event_s {
+	nua_saved_event_t event[1];
+	nua_handle_t *nh;
+	nua_event_data_t const *data;
+	su_time_t when;
+	sip_t *sip;
+	nua_t *nua;
+	int save;
+} sofia_dispatch_event_t;
+static GAsyncQueue *sofia_messages = NULL;
+static sofia_dispatch_event_t exit_sofia_message;
+/* RHEP end */
+
 
 typedef struct janus_sip_message {
 	janus_plugin_session *handle;
@@ -1156,6 +1178,16 @@ static void janus_sip_message_free(janus_sip_message *msg) {
 	msg->jsep = NULL;
 
 	g_free(msg);
+}
+
+// RHEP
+static void janus_sip_notify_message_free(sofia_dispatch_event_t *msg) {
+	if(!msg || msg == &exit_sofia_message)
+	return;
+	nua_destroy_event(msg->event);
+	//su_free(de->nh->nh_home, de);
+	nua_handle_unref(msg->nh);
+	nua_stack_unref(msg->nua);
 }
 
 static void janus_sip_transfer_destroy(janus_sip_transfer *t) {
@@ -1870,6 +1902,14 @@ int janus_sip_init(janus_callbacks *callback, const char *config_path) {
 			}
 		}
 
+		// RHEP
+		item = janus_config_get(config, config_general, janus_config_type_item, "handle_notify_message");
+		if(item != NULL && item->value != NULL)
+			handle_notify_message = janus_is_true(item->value);
+		if(handle_notify_message) {
+			JANUS_LOG(LOG_WARN, "Handle of notify messages is enabled for %s\n", JANUS_SIP_NAME);
+		}
+
 		janus_config_destroy(config);
 	}
 	config = NULL;
@@ -1903,6 +1943,10 @@ int janus_sip_init(janus_callbacks *callback, const char *config_path) {
 	masters = g_hash_table_new(NULL, NULL);
 	transfers = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_sip_transfer_destroy);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_sip_message_free);
+
+	if(handle_notify_message)	// RHEP
+		sofia_messages = g_async_queue_new_full((GDestroyNotify) janus_sip_notify_message_free); 
+
 	/* This is the callback we'll need to invoke to contact the Janus core */
 	gateway = callback;
 
@@ -1918,6 +1962,20 @@ int janus_sip_init(janus_callbacks *callback, const char *config_path) {
 		g_error_free(error);
 		return -1;
 	}
+
+	/* Launch the thread that will handle notify incoming messages - RHEP */
+	if(handle_notify_message)
+	{
+		notify_handler_thread  = g_thread_try_new("sip notify handler", janus_sip_notify_handler, NULL, &error);
+		if(error != NULL) {
+			g_atomic_int_set(&initialized, 0);
+			JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the SIP notify handler thread...\n",
+				error->code, error->message ? error->message : "??");
+			g_error_free(error);
+			return -1;
+		}
+	}
+
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_SIP_NAME);
 	return 0;
 }
@@ -1932,6 +1990,16 @@ void janus_sip_destroy(void) {
 		g_thread_join(handler_thread);
 		handler_thread = NULL;
 	}
+
+	// RHEP
+	if(handle_notify_message) {
+		g_async_queue_push(sofia_messages, &exit_sofia_message);
+		if(notify_handler_thread != NULL) {
+			g_thread_join(notify_handler_thread);
+			notify_handler_thread = NULL;
+		}
+	}
+
 	/* FIXME We should destroy the sessions cleanly */
 	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_destroy(sessions);
@@ -1947,6 +2015,12 @@ void janus_sip_destroy(void) {
 	janus_mutex_unlock(&sessions_mutex);
 	g_async_queue_unref(messages);
 	messages = NULL;
+
+	if(handle_notify_message) {
+		g_async_queue_unref(sofia_messages);	// RHEP
+		sofia_messages = NULL;	// RHEP
+	}	
+
 	g_atomic_int_set(&initialized, 0);
 	g_atomic_int_set(&stopping, 0);
 
@@ -5148,6 +5222,23 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				return;
 			}
 			if(!sip->sip_payload || !sip->sip_payload->pl_data) {
+
+
+				// RHEP - Send event to thread to send a 200 back and ignore the message
+				if(handle_notify_message) {	
+					sofia_dispatch_event_t *de = su_alloc(nh->nh_home, sizeof(*de));
+					memset(de, 0, sizeof(*de));
+					nua_save_event(nua, de->event);
+					de->nh = nua_handle_ref(nh);
+					JANUS_LOG(LOG_VERB, "Sending notify message for ignoring - [%s]", session->account.username);
+					de->data = nua_event_data(de->event);
+					de->sip = sip_object(de->data->e_msg);
+					de->nua = nua_stack_ref(nua);
+					g_async_queue_push(sofia_messages, de);
+					return;
+				}
+
+
 				/* Send a 200 back and ignore the message */
 				nua_respond(nh, 200, sip_status_phrase(200), TAG_END());
 				return;
@@ -5175,6 +5266,20 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, notify, NULL);
 			JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
 			json_decref(notify);
+
+			// RHEP - Send event to thread to send a 200 back
+			if(handle_notify_message) {				
+				sofia_dispatch_event_t *de = su_alloc(nh->nh_home, sizeof(*de));
+				memset(de, 0, sizeof(*de));
+				nua_save_event(nua, de->event);
+				de->nh = nua_handle_ref(nh);
+				JANUS_LOG(LOG_VERB, "Sending notify message - [%s]", session->account.username);
+				de->data = nua_event_data(de->event);
+				de->sip = sip_object(de->data->e_msg);
+				de->nua = nua_stack_ref(nua);
+				g_async_queue_push(sofia_messages, de);
+			}
+
 			break;
 		}
 		case nua_i_options:
@@ -6679,6 +6784,15 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 				SIPTAG_SUPPORTED(NULL),
 				NTATAG_CANCEL_2543(session->account.rfc2543_cancel),
 				TAG_NULL());
+
+	// RHEP	
+	if(handle_notify_message)
+		nua_set_params(session->stack->s_nua,
+					   //NUTAG_ALLOW("NOTIFY"),
+					   NUTAG_APPL_METHOD("NOTIFY"), 
+					   //NUTAG_ALLOW_EVENTS("message-summary"), //TAG_IF(profile->pres_type, NUTAG_ALLOW_EVENTS("message-summary")),
+					   TAG_END());
+
 	su_root_run(session->stack->s_root);
 	/* When we get here, we're done */
 	janus_mutex_lock(&session->stack->smutex);
@@ -6700,4 +6814,28 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 	JANUS_LOG(LOG_VERB, "Leaving sofia loop thread...\n");
 	g_thread_unref(g_thread_self());
 	return NULL;
+}
+
+
+
+
+/* Thread to handle notify incoming messages - RHEP */
+static void *janus_sip_notify_handler(void *data) {
+	JANUS_LOG(LOG_VERB, "Joining SIP Notify handler thread\n");
+	sofia_dispatch_event_t *de = NULL;
+	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+		de = g_async_queue_pop(sofia_messages);
+		if(de == &exit_sofia_message)
+			break;
+
+		JANUS_LOG(LOG_VERB, "Send 200 OK on nofify message\n");
+		nua_respond(de->nh, SIP_200_OK,
+				NUTAG_WITH_THIS_MSG(de->data->e_msg),
+				TAG_END());
+
+		nua_destroy_event(de->event);
+		//su_free(de->nh->nh_home, de);
+		nua_handle_unref(de->nh);
+		nua_stack_unref(de->nua);		
+	}
 }
